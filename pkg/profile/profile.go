@@ -6,14 +6,16 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"hash/fnv"
 	"sync"
 	"unsafe"
-
-	"github.com/maxgio92/yap/pkg/symtable"
 
 	bpf "github.com/aquasecurity/libbpfgo"
 	"github.com/pkg/errors"
 	log "github.com/rs/zerolog"
+
+	"github.com/maxgio92/yap/pkg/dag"
+	"github.com/maxgio92/yap/pkg/symtable"
 )
 
 type HistogramKey struct {
@@ -51,7 +53,7 @@ func NewProfiler(opts ...ProfileOption) *Profiler {
 	return profile
 }
 
-func (p *Profiler) RunProfile(ctx context.Context) (map[string]float64, error) {
+func (p *Profiler) RunProfile(ctx context.Context) (*dag.DAG, error) {
 	bpf.SetLoggerCbs(bpf.Callbacks{
 		Log: func(level int, msg string) {
 			return
@@ -104,10 +106,11 @@ func (p *Profiler) RunProfile(ctx context.Context) (map[string]float64, error) {
 	}
 
 	// Iterate over the stack profile counts histogramMap map.
-	histogram := make(map[string]int, 0)
-	p.logger.Debug().Msg("iterating over the retrieved histogramMap items")
+	counts := make(map[string]int, 0)
+	traces := make(map[string][]string, 0)
+	totalCount := 0
 
-	totalSamples := 0
+	p.logger.Debug().Msg("iterating over the retrieved histogramMap items")
 
 	// Try to load symbols.
 	symbolizationWG := &sync.WaitGroup{}
@@ -152,7 +155,8 @@ func (p *Profiler) RunProfile(ctx context.Context) (map[string]float64, error) {
 		}
 		p.logger.Debug().Int("pid", p.pid).Uint32("user_stack_id", key.UserStackId).Uint32("kernel_stack_id", key.KernelStackId).Int("count", count).Msg("got stack traces")
 
-		var symbols string
+		// symbols contains the symbols list for current trace of the kernel and user stacks.
+		symbols := make([]string, 0)
 
 		// Wait for the symbols to be loaded.
 		symbolizationWG.Wait()
@@ -164,7 +168,7 @@ func (p *Profiler) RunProfile(ctx context.Context) (map[string]float64, error) {
 				p.logger.Err(err).Uint32("id", key.UserStackId).Msg("error getting user stack trace")
 				return nil, errors.Wrap(err, "error getting user stack")
 			}
-			symbols += p.getHumanReadableStackTrace(stackTrace)
+			symbols = append(symbols, p.getHumanReadableStackTrace(stackTrace)...)
 		}
 
 		// Append symbols from kernel stack.
@@ -174,13 +178,68 @@ func (p *Profiler) RunProfile(ctx context.Context) (map[string]float64, error) {
 				p.logger.Err(err).Uint32("id", key.KernelStackId).Msg("error getting kernel stack trace")
 				return nil, errors.Wrap(err, "error getting kernel stack")
 			}
-			symbols += p.getHumanReadableStackTrace(stackTrace)
+			symbols = append(symbols, p.getHumanReadableStackTrace(stackTrace)...)
 		}
 
-		// Increment the histogram map value for the stack trace symbol string (e.g. "main;subfunc;")
-		totalSamples += count
-		histogram[symbols] += count
+		// Build a key for the histogram based on concatenated symbols.
+		var symbolsKey string
+		for _, symbol := range symbols {
+			symbolsKey += fmt.Sprintf("%s;", symbol)
+		}
+
+		// Update the statistics.
+		totalCount += count
+		counts[symbolsKey] += count
+		traces[symbolsKey] = symbols
 	}
 
-	return p.buildResidencyTable(histogram, totalSamples), nil
+	tree, err := buildDAG(counts, traces, totalCount)
+	if err != nil {
+		return nil, errors.Wrap(err, "error building profile DAG")
+	}
+
+	return tree, nil
+}
+
+// buildDAG builds a DAG from the statistics represented by perTraceSampleCounts, totalSampleCount,
+// and the traces map that contains the symbolized function slices.
+func buildDAG(perTraceSampleCounts map[string]int, traces map[string][]string, totalSampleCount int) (*dag.DAG, error) {
+	tree := dag.NewDAG()
+	for k, symbols := range traces {
+		var parentID int64
+		// Stack trace is collected in the same order unwinding is done by the kernel,
+		// so from low to top of the stack.
+		for i := len(symbols) - 1; i >= 0; i-- {
+			var weight float64
+			if i == 0 {
+				weight = float64(perTraceSampleCounts[k]) / float64(totalSampleCount)
+			}
+
+			// Generate a hash from the symbol string for reproducibility.
+			// We want a unique node per function so that the directed graph can be generated
+			// as a tree where parent nodes represent callers and child callee functions.
+			id := generateHash(symbols[i])
+			if n := tree.Node(id); n == nil {
+				tree.AddCustomNode(id, symbols[i], weight)
+			}
+
+			// Set relationships in the DAG.
+			if parentID != 0 {
+				err := tree.AddCustomEdge(parentID, id)
+				if err != nil {
+					return nil, err
+				}
+			}
+			parentID = id
+		}
+	}
+
+	return tree, nil
+}
+
+// generateHash generates a fnv-1a hash from a string.
+func generateHash(s string) int64 {
+	h := fnv.New64a()
+	h.Write([]byte(s))
+	return int64(h.Sum64())
 }
